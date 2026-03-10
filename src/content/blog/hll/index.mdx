@@ -1,0 +1,521 @@
+---
+title: "HyperLogLog, When You Don't Need to Remember Everyone"
+description: "How a 1KB data structure counts 100 million unique visitors, and why your hash map will never forgive you for asking it to"
+date: 2026-02-22
+image: banner.png
+tags: ["hyperloglog", "algorithms", "probabilistic", "data-structures", "c", "systems-programming"]
+---
+
+## The Problem With Counting at Scale
+
+If you asked me how many things I could say about my girlfriend, the answer is simply in the billions. She is, by any reasonable measure, uncountably large in my heart. But this post is about counting. And counting, as it turns out, is one of those things that feels like a solved problem right up until you hit a number big enough to melt everything.
+
+Let's start somewhere comfortable. I run a blog. If I wanted to know how many unique visitors came by today, I would keep a [set](https://en.wikipedia.org/wiki/Set_(abstract_data_type)) of user IDs, toss each visitor into it, and at the end of the day just ask how big it is. Easy. My server does not even blink. Now forget my blog. Think about Google. Around 8.5 billion searches happen every single day. How many unique users search in a day?
+
+A [UUID](https://en.wikipedia.org/wiki/Universally_unique_identifier) is 16 bytes. A [hash set](https://en.wikipedia.org/wiki/Hash_table) costs around 50 bytes per entry once you factor in table internals. Store 1 billion unique user IDs and you are looking at roughly 50 gigabytes. For O-N-E day. And if ten servers are each counting independently and you want a global total, you cannot add those numbers together. [Unique counts do not add](https://en.wikipedia.org/wiki/Inclusion%E2%80%93exclusion_principle). You have to ship every set to one place and compute the [union](https://en.wikipedia.org/wiki/Union_(set_theory)). At scale, that network transfer alone would make me want to quit.
+
+Which brings us to something worth sitting with. What if the exact answer is the wrong thing to want? Does Google need exactly 1,847,293,042 unique users (That number is not a reference to anything, or is it?), or is "roughly 1.85 billion, give or take 1%" good enough to make every decision that follows? Because if you are willing to tolerate a small [margin of error](https://en.wikipedia.org/wiki/Margin_of_error), you can count billions of distinct things using a few kilobytes of memory. That is the promise of [HyperLogLog](https://en.wikipedia.org/wiki/HyperLogLog) (It's a funny name, isn't it?)
+
+## The Naive Approaches and Why They Fail
+
+### Hash Sets
+
+The first instinct is the hash set (every comp sci student knows to throw this and hash map in interviews). You have seen this already. Every time a new element arrives, you throw it in. At the end, you ask for the size. The beauty of this is that it handles duplicates automatically. The ugliness is that it stores basically everything. In C, a naive exact counter looks something like this
+
+```c 
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#define MAX_ELEMENTS 1e9
+
+typedef struct
+{
+  uint64_t* ids;
+  size_t count;
+  size_t capacity;
+} ExactCounter;
+
+size_t
+exact_counter_memory(size_t n_elements)
+{
+  size_t id_storage = n_elements * sizeof(uint64_t);
+  size_t overhead = n_elements * 32;
+  return id_storage + overhead;
+}
+
+int
+main(void)
+{
+  size_t n = 1e9;
+  size_t bytes = exact_counter_memory(n);
+  printf("Memory required: %.2f GB\n", (double)bytes / 1e9);
+  return 0;
+}
+```
+
+```
+Memory required: 40.00 GB
+```
+
+And that is being generous. Real hash table implementations carry a much larger overhead than that!!
+
+### Bitmaps
+
+The second instinct is a [bitmap](https://en.wikipedia.org/wiki/Bit_array). Assign every possible user ID a position in a giant bit array. If you see user 42, flip bit 42 to 1. Count the 1s at the end. This is clever because you compress each user down to a single bit, which is about as small as you can get per element. But the bitmap has to be as large as your entire ID space upfront. If your user IDs are 32 bit integers, you need a $2^{32}$ bit array, which is 512 megabytes, allocated whether you have one user or four billion. And if you are working with 64bit IDs or arbitrary strings? The bitmap becomes a number so large it stops being funny (it never was tbh)
+
+### Where We Actually Are
+
+Exact counting works perfectly, and it is completely impractical at scale. Both approaches carry a memory cost that is either proportional to the data you have seen, or proportional to the data you could possibly see. Either way, you lose. What we actually need is a structure whose memory cost is proportional to neither. Something that stays small, and somehow can still give us a reasonable answer
+
+## Building HLL
+
+### The Coin Flip
+
+Okay so here is where things get fun. I want you to forget about data structures for a second. Forget about memory. Forget about Google. Let's just flip some coins!
+
+Imagine I flip a coin until I get heads, and I tell you the result. If I say "I got heads on the first flip", that is not very surprising. That happens all the time. But if I say "I flipped tails fourteen times in a row before finally getting heads", you would probably raise an eyebrow. That is a rare sequence. And the key question is that if I told you I saw that sequence, how many total flips do you think I made across the whole experiment? Probably a lot, right? You would not expect to stumble into fourteen consecutive tails after just a handful of tries (you actually might, its not THAT rare)
+
+Now let's make it concrete. Instead of coins, we use a [hash function](https://en.wikipedia.org/wiki/Hash_function). You take an element, any element, and you hash it into a uniform bit string. A good hash function spreads its outputs uniformly across all possible bit patterns, which means each bit is independently, equally likely to be 0 or 1. Just like a coin flip
+
+Now look at the leading zeros of that hash. A hash that starts with `0` happens with probability $1/2$. A hash that starts with `00` happens with probability $1/4$. A hash that starts with `000...` k times happens with probability $(1/2^k)$. So if the maximum number of leading zeros you have ever seen across all your hashed elements is $k$, then a rough estimate of the number of distinct elements you have processed is $2^k$
+
+We did not store any of those things. We just kept track of one number?!
+
+Here is a small sketch of that estimator
+
+```c
+#include <stdint.h>
+
+int
+leading_zeros(uint32_t hash)
+{
+  if (hash == 0)
+    return 32;
+  int count = 0;
+  while ((hash & 0x80000000) == 0) {
+    count++;
+    hash <<= 1;
+  }
+  return count;
+}
+
+uint64_t
+estimate_cardinality(int max_leading_zeros)
+{
+  return 1ULL << max_leading_zeros;
+}
+```
+
+You hash each element, compute the leading zeros, keep track of the maximum you have seen so far, and at the end you raise 2 to that power. The entire state of your counter is a single integer. Not a set. Not a bitmap. Just O-N-E integer
+
+Of course, if you actually ran this on real data you would find that the estimate is pretty terrible. Sometimes you get lucky and see a weird hash early on, and the estimator thinks you have seen way more elements than you have. Sometimes the opposite. The variance is enormous, but it's a good step in the direction, right?
+
+### Reducing Variance With Stochastic Averaging
+
+So we have a single integer tracking the maximum leading zeros we have ever seen, and it gives us a wildly noisy estimate. The question is, how do we fix that?
+
+Think about it this way. If I asked you to estimate the average height of everyone in a city by picking one person at random, you might get lucky and pick someone perfectly average, or you might pick a 7 foot basketball player and conclude that this is a city of giants. One sample is just not enough. But what if you picked 1000 people at random and averaged them? Now we are in much better shape! (Zion, please lay off the burgers)
+
+This is exactly the idea behind [stochastic averaging](https://en.wikipedia.org/wiki/Stochastic_approximation)!
+
+Instead of keeping one maximum leading zeros counter, we keep many. We split the hash space into `m` buckets, called registers. The first `b` bits of the hash decide which register the element goes into. The remaining bits are used to compute the leading zeros. Each register independently tracks the maximum leading zeros it has ever seen. Now instead of one noisy estimate, we have `m` independent noisy estimates, one per register, and we can average them out!
+
+Here is what that looks like
+
+```c
+#include <stdint.h>
+#include <string.h>
+
+#define HLL_BITS 8
+#define HLL_REGISTERS (1 << HLL_BITS)
+
+typedef struct
+{
+  uint8_t registers[HLL_REGISTERS];
+} HyperLogLog;
+
+void
+hll_init(HyperLogLog* hll)
+{
+  memset(hll->registers, 0, sizeof(hll->registers));
+}
+
+int
+leading_zeros(uint32_t x)
+{
+  if (x == 0)
+    return 32;
+  int n = 0;
+  while ((x & 0x80000000) == 0) {
+    n++;
+    x <<= 1;
+  }
+  return n;
+}
+
+void
+hll_add(HyperLogLog* hll, uint32_t hash)
+{
+  uint32_t index = hash >> (32 - HLL_BITS);
+  uint32_t remaining = hash << HLL_BITS;
+  uint8_t zeros = leading_zeros(remaining) + 1;
+  if (zeros > hll->registers[index])
+    hll->registers[index] = zeros;
+}
+```
+
+Walk through what is happening here. We define 256 registers ($2^8$, since `HLL_BITS` is 8). When an element arrives, its hash is split. The top 8 bits pick the register, and the bottom 24 bits are used to count leading zeros. That count, plus one, gets stored in the register if it beats the current maximum. That `+ 1` matters, we will come back to it when we talk about the estimator formula (it will get real nerdy)
+
+Now here is the thing worth pausing on. We went from storing every element, to storing 256 single byte integers. That is 256 bytes. For the entire counter. And those 256 bytes can represent estimates over billions of distinct elements
+
+The more registers you use, the more accurate your estimate, but the more memory you spend. With 256 registers you get a standard error of around 6.5%. With 1024 you get around 3.2%. With 16384 (what [redis](https://redis.io/) uses) you get around 0.81%. And that is absolutely amazing with how big these estimates get
+
+### The Harmonic Mean Estimator
+
+We have our registers. We have our leading zeros. Now we need to turn a bag of 256 small integers into a single number that means something
+
+The naive thing to do would be to take the arithmetic mean of $2^{register[i]}$ across all registers and call it a day. And honestly? It would kind of work. But it would also be systematically wrong. The problem is that a single register with a freakishly high leading zero count, say 20, contributes $2^{20} = 1,048,576$ to the average. One lucky hash poisons the whole estimate upward
+
+What we want instead is the [harmonic mean](https://en.wikipedia.org/wiki/Harmonic_mean). Instead of averaging the values, we average their reciprocals and then flip it. Outliers that are large become small reciprocals, so they get naturally suppressed. The formula for the HLL cardinality estimate looks like this (I know it is a little horrifying)
+
+$$
+E = \alpha_m \cdot m^2 \cdot \left( \sum_{j=1}^{m} 2^{-M[j]} \right)^{-1}
+$$
+
+Let's walk through every piece of this. $m$ is the number of registers. $M[j]$ is the value stored in register $j$, which is the maximum leading zeros (plus one that we saw for that bucket). The sum $\sum 2^{-M[j]}$ is summing up the reciprocals of $2^{M[j]}$ across all registers. The outer $m^2$ scales things back up. And $\alpha_m$ is a bias correction constant that accounts for a systematic underestimation that falls out of the math. Its value depends on $m$
+
+$$
+\alpha_{16} = 0.673, \quad \alpha_{32} = 0.697, \quad \alpha_{64} = 0.709, \quad \alpha_m \approx \frac{0.7213}{1 + 1.079/m} \text{ for } m \geq 128
+$$
+
+That correction constant is not pulled from thin air. It comes from the original [Flajolet et al. paper](http://algo.inria.fr/flajolet/Publications/FlFuGaMe07.pdf) and is derived from the expected bias of the harmonic mean estimator applied to this specific distribution. You do not need to derive it, just trust that very smart people did the work, and this is what came out (basically most of the math around computer science)
+
+Here is what the estimator looks like
+
+```c
+#include <math.h>
+
+double
+alpha(int m)
+{
+  switch (m) {
+    case 16:
+      return 0.673;
+    case 32:
+      return 0.697;
+    case 64:
+      return 0.709;
+    default:
+      return 0.7213 / (1.0 + 1.079 / m);
+  }
+}
+
+double
+hll_estimate(HyperLogLog* hll)
+{
+  double sum = 0.0;
+  for (int i = 0; i < HLL_REGISTERS; i++)
+    sum += pow(2.0, -(double)hll->registers[i]);
+
+  double m = HLL_REGISTERS;
+  return alpha(HLL_REGISTERS) * m * m / sum;
+}
+```
+
+And that is basically what it is. Hash the element, route it to a register, update the max leading zeros, and when you want an estimate, run the harmonic mean formula with the bias correction. The whole thing fits in your head once you see all the pieces together
+
+## Handling the Edge Cases
+
+This estimator works beautifully in the middle range of cardinalities, but it starts lying to you at the extremes. When you have seen very few elements, or when your registers are nearly full, the estimate starts to drift. And for that, we need a couple of small corrections that are worth knowing about
+
+### The Small Range Correction
+
+When you have only seen a handful of distinct elements, many of your registers are still sitting at zero. They have never been touched. And a zero register contributes $2^0 = 1$ to the harmonic sum, which is a perfectly fine value, except that it does not mean "this register saw an element with zero leading zeros". It means "this register has seen nothing at all". The estimator cannot tell the difference, and it quietly overcounts, we don't need that
+
+The fix is to use [linear counting](https://en.wikipedia.org/wiki/Linear_counting), a much simpler algorithm that works great at low cardinalities. Count the number of registers that are still zero, call it $V$. Then the linear counting estimate becomes
+
+$$
+E_{small} = m \cdot \ln\left(\frac{m}{V}\right)
+$$
+
+When the raw HLL estimate is below $(\frac{5}{2} \cdot m)$, we use this instead. It sounds arbitrary but it is just the threshold below which linear counting is more accurate than the harmonic mean estimator. Here is what that looks like in code
+
+```c
+double
+hll_estimate(HyperLogLog* hll)
+{
+  double sum = 0.0;
+  int zero_registers = 0;
+
+  for (int i = 0; i < HLL_REGISTERS; i++) {
+    sum += pow(2.0, -(double)hll->registers[i]);
+    if (hll->registers[i] == 0)
+      zero_registers++;
+  }
+
+  double m = HLL_REGISTERS;
+  double estimate = alpha(HLL_REGISTERS) * m * m / sum;
+
+  if (estimate <= 2.5 * m && zero_registers > 0)
+    return m * log(m / zero_registers);
+
+  return estimate;
+}
+```
+
+### The Large Range Correction
+
+At the other extreme, when you have seen so many distinct elements that most registers are holding large values, the $2^{-M[j]}$ terms become so tiny that floating point arithmetic starts eating them. The sum loses its precision, the estimate drifts, and you get answers that are quietly wrong 
+
+The correction here kicks in when the estimate exceeds $(\frac{1}{30} \cdot 2^{32})$, which is roughly 143 million for 32 bit hashes. At that point we switch to this
+
+$$
+E_{large} = -2^{32} \cdot \ln\left(1 - \frac{E}{2^{32}}\right)
+$$
+
+This is a correction for hash collisions. At very high cardinalities, different elements start colliding onto the same hash values, and the estimator undershoots. This formula compensates for that. Now, we add it to the estimator
+
+```c
+double
+hll_estimate(HyperLogLog* hll)
+{
+  double sum = 0.0;
+  int zero_registers = 0;
+
+  for (int i = 0; i < HLL_REGISTERS; i++) {
+    sum += pow(2.0, -(double)hll->registers[i]);
+    if (hll->registers[i] == 0)
+      zero_registers++;
+  }
+
+  double m = HLL_REGISTERS;
+  double estimate = alpha(HLL_REGISTERS) * m * m / sum;
+
+  if (estimate <= 2.5 * m && zero_registers > 0)
+    return m * log(m / (double)zero_registers);
+
+  double pow_32 = 4294967296.0;
+  if (estimate > pow_32 / 30.0)
+    return -pow_32 * log(1.0 - estimate / pow_32);
+
+  return estimate;
+}
+```
+
+## The Full Implementation
+
+Alright, we have built every piece of this incrementally. The hash routing, the register updates, the harmonic mean, the corrections. Now let's put it all together into something you could actually compile and run.
+
+One thing we have glossed over until now is the hash function itself. Everything we have built assumes that elements hash uniformly across all bit patterns. If your hash function is bad, the whole thing will fall apart. We will use [MurmurHash3](https://en.wikipedia.org/wiki/MurmurHash), a fast, non cryptographic hash function with excellent distribution properties!!
+
+```c
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#define HLL_BITS 8
+#define HLL_REGISTERS (1 << HLL_BITS)
+
+typedef struct
+{
+  uint8_t registers[HLL_REGISTERS];
+} HyperLogLog;
+
+uint32_t
+murmur3(const void* key, int len, uint32_t seed)
+{
+  const uint8_t* data = (const uint8_t*)key;
+  const int nblocks = len / 4;
+  uint32_t h1 = seed;
+  const uint32_t c1 = 0xcc9e2d51;
+  const uint32_t c2 = 0x1b873593;
+
+  const uint32_t* blocks = (const uint32_t*)(data + nblocks * 4);
+  for (int i = -nblocks; i; i++) {
+    uint32_t k1 = blocks[i];
+    k1 *= c1;
+    k1 = (k1 << 15) | (k1 >> 17);
+    k1 *= c2;
+    h1 ^= k1;
+    h1 = (h1 << 13) | (h1 >> 19);
+    h1 = h1 * 5 + 0xe6546b64;
+  }
+
+  const uint8_t* tail = data + nblocks * 4;
+  uint32_t k1 = 0;
+  switch (len & 3) {
+    case 3:
+      k1 ^= tail[2] << 16;
+    case 2:
+      k1 ^= tail[1] << 8;
+    case 1:
+      k1 ^= tail[0];
+      k1 *= c1;
+      k1 = (k1 << 15) | (k1 >> 17);
+      k1 *= c2;
+      h1 ^= k1;
+  }
+
+  h1 ^= len;
+  h1 ^= h1 >> 16;
+  h1 *= 0x85ebca6b;
+  h1 ^= h1 >> 13;
+  h1 *= 0xc2b2ae35;
+  h1 ^= h1 >> 16;
+  return h1;
+}
+
+void
+hll_init(HyperLogLog* hll)
+{
+  memset(hll->registers, 0, sizeof(hll->registers));
+}
+
+int
+leading_zeros(uint32_t x)
+{
+  if (x == 0)
+    return 32;
+  int n = 0;
+  while ((x & 0x80000000) == 0) {
+    n++;
+    x <<= 1;
+  }
+  return n;
+}
+
+void
+hll_add(HyperLogLog* hll, const void* data, int len)
+{
+  uint32_t hash = murmur3(data, len, 0xdeadbeef);
+  uint32_t index = hash >> (32 - HLL_BITS);
+  uint32_t remaining = hash << HLL_BITS;
+  uint8_t zeros = leading_zeros(remaining) + 1;
+  if (zeros > hll->registers[index])
+    hll->registers[index] = zeros;
+}
+
+double
+alpha(int m)
+{
+  switch (m) {
+    case 16:
+      return 0.673;
+    case 32:
+      return 0.697;
+    case 64:
+      return 0.709;
+    default:
+      return 0.7213 / (1.0 + 1.079 / m);
+  }
+}
+
+double
+hll_estimate(HyperLogLog* hll)
+{
+  double sum = 0.0;
+  int zero_registers = 0;
+
+  for (int i = 0; i < HLL_REGISTERS; i++) {
+    sum += pow(2.0, -(double)hll->registers[i]);
+    if (hll->registers[i] == 0)
+      zero_registers++;
+  }
+
+  double m = HLL_REGISTERS;
+  double estimate = alpha(HLL_REGISTERS) * m * m / sum;
+
+  if (estimate <= 2.5 * m && zero_registers > 0)
+    return m * log(m / (double)zero_registers);
+
+  double pow_32 = 4294967296.0;
+  if (estimate > pow_32 / 30.0)
+    return -pow_32 * log(1.0 - estimate / pow_32);
+
+  return estimate;
+}
+
+int
+main(void)
+{
+  HyperLogLog hll;
+  hll_init(&hll);
+
+  char buf[32];
+  int n = 1000000;
+  for (int i = 0; i < n; i++) {
+    snprintf(buf, sizeof(buf), "user_%d", i);
+    hll_add(&hll, buf, strlen(buf));
+  }
+
+  double estimate = hll_estimate(&hll);
+  printf("Actual: %d\n", n);
+  printf("Estimated: %.0f\n", estimate);
+  printf("Error: %.4f%%\n", 100.0 * (estimate - n) / n);
+  return 0;
+}
+```
+
+```
+Actual: 1000000
+Estimated: 1027286
+Error: 2.7286%
+```
+
+2.73% error. One million distinct elements. 256 bytes of memory. That is well within one standard deviation of the theoretical 6.5% error bound for 256 registers, and that is absolutely amazing!!
+
+## HLL in the Real World
+
+### Redis
+
+The most famous deployment of HLL is in [redis](https://redis.io/). Redis ships HLL as a first class data type with three commands: `PFADD` to add elements, `PFCOUNT` to get the estimate, and `PFMERGE` to combine multiple HLLs into one. The `PF` prefix is a tribute to Philippe Flajolet, the mathematician who invented HLL, which is a genuinely lovely thing for a database to do. Redis uses 16384 registers and guarantees a standard error of 0.81%, using only 12KB of memory per counter regardless of how many elements you throw at it (I think I said this before?)
+
+### Counting Unique Visitors
+
+This is the canonical use case. Every analytics platform, from the small indie tool to the enterprise behemoth, needs to answer "how many unique users visited today?" An HLL counter per page per day gives you that answer in constant memory, with merging across time windows for free. You want weekly uniques? Merge the seven daily HLLs. Monthly? Merge thirty. And that answers our original posed problem
+
+### Databases
+
+[Apache Spark](https://spark.apache.org/), [Apache Flink](https://flink.apache.org/), [BigQuery](https://cloud.google.com/bigquery), [Redshift](https://aws.amazon.com/redshift/) and [Snowflake](https://www.snowflake.com/) all have native HLL support for approximate distinct count queries. When you run `SELECT APPROX_COUNT_DISTINCT(user_id) FROM events`, you are almost certainly running an HLL under the hood. The query planner knows that exact distinct counts are expensive, and that for most analytical workloads, an approximation that runs ten times faster is the right call
+
+### Network Traffic Analysis
+
+Network engineers use HLL to count distinct source IPs, destination ports, or flow pairs over rolling time windows. The kind of cardinality questions that come up during a DDoS investigation or capacity planning session. You are looking at millions of packets per second and you need to know if the number of unique sources just spiked. An HLL sitting in a line rate data path gives you that signal without melting your memory bus
+
+### A/B Testing and Experimentation Platforms
+
+When you are running an experiment and you need to know how many unique users were exposed to each variant, HLL gives you that count cheaply enough that you can run it continuously across thousands of concurrent experiments without dedicated infrastructure for each one
+
+The common thread across all of these is the same. Large streams of data, cardinality questions, memory budgets that exact counting would blow through, and a tolerance for a less than 1% margin of error that nobody in the room actually minds!
+
+## HLL vs Exact Counting
+
+At this point you might be wondering when you should actually reach for HLL and when you should just use a set. The honest answer is that it depends on a few things (like always)
+
+| Property | Exact Counting | HyperLogLog |
+|---|---|---|
+| Memory usage | O(n), grows with data | O(1), fixed ~12KB |
+| Accuracy | 100% exact | ~0.81% std error |
+| Insert speed | O(1) average | O(1) |
+| Merge across servers | Expensive, ship full sets | Cheap, just take register max |
+| Works with arbitrary data | Yes | Yes, via hashing |
+| Handles deletions | Yes, remove from set | No |
+| Queryable membership | Yes | No |
+
+The merge story is really where HLL shines in distributed systems. Merging two HLLs is just taking the element wise maximum of their register arrays. And that is it! You can shard your counters across a hundred machines and combine them in microseconds
+
+The deletion story is where HLL genuinely loses. There is no way to remove an element from an HLL. Once a leading zero count is recorded in a register, you cannot 'un record' it. If you need to support deletions, or sliding windows where old data expires, you need a different approach, either an exact structure or something like a count min sketch paired with timestamps (and it gets super complicated, trust me)
+
+Membership queries are also off the table. An HLL can tell you approximately how many distinct things it has seen, but it cannot tell you whether a specific thing is in the set. If you need that, you want a [bloom filter](https://en.wikipedia.org/wiki/Bloom_filter), which is a whole other beautiful rabbit hole (it was my original idea for this blog)
+
+So the decision is actually pretty clean. If you need exact counts, membership queries, or deletion support, use a set. If you have high cardinality data, distributed counters, memory constraints, and you can live with a low rate of error, HLL is the right tool and it is not even close!
+
+## Conclusion
+
+There is something I find genuinely beautiful about probabilistic data structures as a whole. They are a reminder that perfect information is not always the goal. Sometimes the goal is a good enough answer, delivered fast, at a cost you can actually afford. HLL is one of the cleanest examples of that philosophy I know of. A few kilobytes, a hash function, a bit of clever math (a **bit** might be an understatement though) 
+
+Philippe Flajolet published the original HyperLogLog paper in 2007. He passed away in 2011. Redis named its commands after him. I think that is a pretty good way to be remembered
+
+If you want to dig deeper, the [original paper](http://algo.inria.fr/flajolet/Publications/FlFuGaMe07.pdf) is surprisingly readable for something that dense with math. And if you want to see a production grade implementation, the [redis source](https://github.com/redis/redis/blob/unstable/src/hyperloglog.c) is one of the best annotated C files I have ever read!

@@ -1,0 +1,80 @@
+---
+import PageHead from "@/components/PageHead.astro"
+import { SOCIAL_LINKS } from "@/consts"
+import Layout from "@/layouts/Layout.astro"
+import { Icon } from "astro-icon/components"
+
+const githubHref =
+  SOCIAL_LINKS.find((link) => link.label === "GitHub")?.href ?? "#"
+const linkedinHref =
+  SOCIAL_LINKS.find((link) => link.label === "LinkedIn")?.href ?? "#"
+---
+
+<Layout class="max-w-3xl">
+  <PageHead slot="head" title="About" />
+  <section class="mt-12">
+    <div class="flex flex-col items-center text-center">
+      <img
+        src="/static/logo.svg"
+        alt="Logo"
+        class="h-24 w-24 rounded-full"
+        loading="eager"
+      />
+      <h1 class="mt-6 text-3xl font-semibold tracking-tight">About Me</h1>
+      <div
+        class="mt-6 flex flex-wrap justify-center gap-4 text-sm font-semibold"
+      >
+        <a
+          href={githubHref}
+          target="_blank"
+          rel="noreferrer noopener"
+          aria-label="GitHub"
+          class="brutal-link inline-flex items-center gap-2 text-sm font-semibold"
+        >
+          <Icon name="lucide:github" class="h-5 w-5" />
+          GitHub
+        </a>
+        <a
+          href={linkedinHref}
+          target="_blank"
+          rel="noreferrer noopener"
+          aria-label="LinkedIn"
+          class="brutal-link inline-flex items-center gap-2 text-sm font-semibold"
+        >
+          <Icon name="lucide:linkedin" class="h-5 w-5" />
+          LinkedIn
+        </a>
+      </div>
+    </div>
+  </section>
+  <section class="prose prose-neutral dark:prose-invert mt-12 max-w-none">
+    <p>
+      Nearly eight years ago, I fell down the Linux rabbit hole (and watching
+      Matrix may or not may not have been a part of it). I was drawn to free and
+      open source software, to the idea that every layer of the system was
+      visible, and configurable
+    </p>
+    <p>
+      I broke everything, and then I would spend hours rebuilding what I had
+      just destroyed. Somewhere in that cycle of breaking and rebuilding, I
+      started to get interested in development
+    </p>
+    <p>
+      Programming grew naturally out of that environment. At first it was small
+      scripts. Then tools. Then projects. If something did not exist, I could
+      build it, and just thinking of something and implementing it became very
+      enjoyable
+    </p>
+    <p>
+      Today, I am pursuing a bachelors degree in computer science while
+      continuing to build as much as I can. Also focusing on pulling my old
+      projects from the grave and now adding them to my portfolio
+    </p>
+    <p>
+      I would call myself a jack of all trades, though probably more of a deuce.
+      Either way, my girlfriend finally got me to stop sitting on this and
+      actually start writing, so here we are. Looking forward to seeing where it
+      goes
+    </p>
+  </section>
+</Layout>
